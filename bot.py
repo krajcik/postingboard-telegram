@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import contextlib
 import fcntl
 import hashlib
@@ -15,7 +16,7 @@ import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, quote
-from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.request import Request, build_opener, HTTPRedirectHandler, ProxyHandler
 
 
 LOG = logging.getLogger("postingboard-telegram")
@@ -43,14 +44,14 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def request_json(service, url, *, headers=None, data=None):
+def request_json(service, url, *, headers=None, data=None, proxy=None):
     payload = None if data is None else json.dumps(data).encode("utf-8")
     request = Request(url, data=payload, headers={
-        "Accept": "application/json", **(headers or {}),
+        "Accept": "application/json", "User-Agent": "postingboard-telegram/0.1", **(headers or {}),
         **({"Content-Type": "application/json"} if data is not None else {}),
     })
     try:
-        with build_opener(NoRedirect).open(request, timeout=30) as response:
+        with build_opener(ProxyHandler({"https": proxy} if proxy else {}), NoRedirect).open(request, timeout=30) as response:
             result = json.load(response)
     except HTTPError as exc:
         retry = exc.headers.get("Retry-After")
@@ -60,6 +61,7 @@ def request_json(service, url, *, headers=None, data=None):
                 retry = error.get("parameters", {}).get("retry_after", retry)
             except (ValueError, AttributeError):
                 pass
+        exc.close()
         raise APIError(service, exc.code, retry) from None
     except (URLError, OSError, ValueError):
         raise MirrorError(f"{service}: сетевая ошибка или некорректный JSON") from None
@@ -128,12 +130,15 @@ class PostingBoard:
         self.last_request = 0.0
 
     def get(self, path, **query):
+        return self.get_url(self.base_url + "/v1/" + path, query)
+
+    def get_url(self, url, query):
         wait = 0.25 - (time.monotonic() - self.last_request)
         if wait > 0:
             time.sleep(wait)
         suffix = "?" + urlencode(query) if query else ""
         try:
-            return request_json("Posting Board", self.base_url + "/v1/" + path + suffix,
+            return request_json("Posting Board", url + suffix,
                                 headers=self.headers)
         finally:
             self.last_request = time.monotonic()
@@ -147,18 +152,24 @@ class PostingBoard:
             raise MirrorError("Posting Board: в post отсутствует полный body")
         return post
 
+    def activity_page(self, cursor=0, before=None):
+        query = {"limit": 30}
+        if before is not None:
+            query["before"] = before
+        elif cursor:
+            query["after"] = cursor
+        return self.get("activity", **query)
+
     def activity_since(self, cursor):
         """Сначала получаем всё окно; затем отдаём события от старых к новым.
 
         after и before несовместимы. Последующие страницы запрашиваются через
         before, а нижняя граница cursor проверяется локально.
         """
-        query = {"limit": 30}
-        if cursor:
-            query["after"] = cursor
+        previous_before = None
         events, seen_before = {}, set()
         while True:
-            page = self.get("activity", **query)
+            page = self.activity_page(cursor, previous_before)
             items = page.get("items")
             if not isinstance(items, list):
                 raise MirrorError("Posting Board: некорректная страница activity")
@@ -179,22 +190,62 @@ class PostingBoard:
             if before is None:
                 break
             positive_int(before, "next_before")
-            if before in seen_before or ("before" in query and before >= query["before"]):
+            if before in seen_before or (previous_before is not None and before >= previous_before):
                 raise MirrorError("Posting Board: пагинация не продвигается")
             seen_before.add(before)
-            query = {"limit": 30, "before": before}
+            previous_before = before
         return [events[seq] for seq in sorted(events)]
 
 
+class UnsortedBoard(PostingBoard):
+    """Анонимная /b: полные тексты в общей ленте, единственный фильтр — before."""
+
+    def __init__(self, base_url):
+        super().__init__(base_url, "")
+        self.headers = {}
+        self.cache = {}
+
+    @staticmethod
+    def normalize(item):
+        if (not isinstance(item, dict) or not isinstance(item.get("body"), str)
+                or not isinstance(item.get("id"), str)):
+            raise MirrorError("Posting Board /b: некорректная запись")
+        title = next((line.strip() for line in item["body"].splitlines() if line.strip()), "Без заголовка")
+        return {**item, "author": "Anonymous", "topic": "/b", "title": split_text(title, 80)[0]}
+
+    def activity_page(self, cursor=0, before=None):
+        query = {"before": before} if before is not None else {}
+        page = self.get_url(self.base_url + "/b", query)
+        items = page.get("items")
+        if not isinstance(items, list):
+            raise MirrorError("Posting Board /b: некорректная лента")
+        normalized = [self.normalize(item) for item in items]
+        self.cache.update((item["id"], item) for item in normalized)
+        return {**page, "items": normalized}
+
+    def post(self, post_id):
+        if post_id not in self.cache:
+            # Reply уже есть в ленте; отдельный запрос нужен только для его root.
+            result = self.get_url(self.base_url + "/b/t/" + quote(post_id, safe=""), {})
+            post = self.normalize(result.get("post"))
+            if post["id"] != post_id:
+                raise MirrorError("Posting Board /b: не совпадает ID корня")
+            self.cache[post_id] = post
+        return self.cache[post_id]
+
+
 class Telegram:
-    def __init__(self, token, chat_id, interval=3.1):
+    def __init__(self, token, chat_id, interval=3.1, proxy=None):
         self.url = "https://api.telegram.org/bot" + token + "/"
         self.chat_id = chat_id
         self.interval = max(3.1, interval)
         self.last_mutation = 0.0
+        if proxy and (urlsplit(proxy).scheme not in ("http", "https") or not urlsplit(proxy).hostname):
+            raise MirrorError("TELEGRAM_PROXY_URL должен быть HTTP(S)-адресом прокси")
+        self.proxy = proxy
 
     def call(self, method, data):
-        result = request_json("Telegram", self.url + method, data=data)
+        result = request_json("Telegram", self.url + method, data=data, proxy=self.proxy)
         if result.get("ok") is not True:
             raise APIError("Telegram", result.get("error_code", "unknown"),
                            result.get("parameters", {}).get("retry_after"))
@@ -345,6 +396,9 @@ class Mirror:
         return topic_id
 
     def sync(self):
+        return sum(self.sync_events())
+
+    def sync_events(self):
         if self.state.pending():
             raise UncertainDelivery("Есть операции с неизвестным результатом; выполните pending")
         events = self.source.activity_since(self.state.cursor)
@@ -357,12 +411,31 @@ class Mirror:
                 self.send_post(post, topic_id)
             self.state.set("cursor", event["seq"])
             LOG.info("Синхронизировано событие seq=%s", event["seq"])
-        return len(events)
+            yield 1
+
+
+def sync_all(mirrors):
+    """Чередуем события досок, используя общий ограничитель Telegram."""
+    if any(mirror.state.pending() for mirror in mirrors.values()):
+        raise UncertainDelivery("Есть операции с неизвестным результатом; выполните pending")
+    active = deque((name, mirror.sync_events()) for name, mirror in mirrors.items())
+    counts = dict.fromkeys(mirrors, 0)
+    while active:
+        name, events = active.popleft()
+        try:
+            next(events)
+        except StopIteration:
+            continue
+        counts[name] += 1
+        active.append((name, events))
+    return counts
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument("--board", choices=("all", "named", "b"), default="all",
+                        help="Доска: по умолчанию обе; named — основная, b — анонимная")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check", help="Проверить доступ и права без отправки сообщений")
     commands.add_parser("run", help="Зеркалировать всю историю и новые события")
@@ -383,34 +456,54 @@ def main(argv=None):
     except ValueError:
         raise MirrorError("Некорректный CHAT_ID или интервал") from None
     state_path = Path(os.environ.get("STATE_PATH", ".state/mirror.sqlite3"))
+    anonymous_path = Path(os.environ.get("ANONYMOUS_STATE_PATH", str(state_path.with_name(state_path.stem + ".b" + state_path.suffix))))
+    boards = {"named": (state_path, source_url), "b": (anonymous_path, source_url.rstrip("/") + "/b")}
+    if args.board != "all":
+        boards = {args.board: boards[args.board]}
     if args.command in ("pending", "resolve"):
-        if not state_path.is_file():
-            raise MirrorError("База состояния ещё не создана")
-        with contextlib.closing(State(state_path, source_url, chat_id)) as state:
-            if args.command == "pending":
-                print(json.dumps(state.pending(), ensure_ascii=False))
-            else:
-                state.resolve(args.key, args.telegram_id, args.retry)
-                print("Операция разрешена. Следующий запуск продолжит синхронизацию.")
+        if args.command == "resolve" and args.board == "all":
+            raise MirrorError("Для resolve укажите --board named или --board b перед командой")
+        result = {}
+        for name, (path, identity) in boards.items():
+            if not path.is_file():
+                if args.command == "resolve":
+                    raise MirrorError("База состояния этой доски ещё не создана")
+                result[name] = []
+                continue
+            with contextlib.closing(State(path, identity, chat_id)) as state:
+                if args.command == "pending":
+                    result[name] = state.pending()
+                else:
+                    state.resolve(args.key, args.telegram_id, args.retry)
+        print(json.dumps(result, ensure_ascii=False) if args.command == "pending" else "Операция разрешена.")
         return
-    source = PostingBoard(source_url, required_env("POSTINGBOARD_API_KEY"))
-    telegram = Telegram(required_env("TELEGRAM_BOT_TOKEN"), chat_id, interval)
+    sources = {}
+    if "named" in boards:
+        sources["named"] = PostingBoard(source_url, required_env("POSTINGBOARD_API_KEY"))
+    if "b" in boards:
+        sources["b"] = UnsortedBoard(source_url)
+    telegram = Telegram(required_env("TELEGRAM_BOT_TOKEN"), chat_id, interval,
+                        os.environ.get("TELEGRAM_PROXY_URL") or None)
     bot_id = telegram.preflight()
-    source.get("activity", limit=1)
+    for source in sources.values():
+        source.activity_page()
     if args.command == "check":
         print("Доступ к Posting Board и права Telegram проверены. Сообщения не отправлялись.")
         return
-    with contextlib.closing(State(state_path, source_url, chat_id)) as state:
-        saved_bot = state.get("bot_id")
-        if saved_bot and saved_bot != str(bot_id):
-            raise MirrorError("STATE_PATH относится к другому Telegram-боту")
-        state.set("bot_id", bot_id)
-        mirror = Mirror(source, telegram, state)
+    with contextlib.ExitStack() as stack:
+        mirrors = {}
+        for name, (path, identity) in boards.items():
+            state = stack.enter_context(contextlib.closing(State(path, identity, chat_id)))
+            saved_bot = state.get("bot_id")
+            if saved_bot and saved_bot != str(bot_id):
+                raise MirrorError("STATE_PATH относится к другому Telegram-боту")
+            state.set("bot_id", bot_id)
+            mirrors[name] = Mirror(sources[name], telegram, state)
         while True:
             delay = poll
             try:
-                count = mirror.sync()
-                LOG.info("Цикл завершён: %s событий, cursor=%s", count, state.cursor)
+                counts = sync_all(mirrors)
+                LOG.info("Цикл завершён: %s", counts)
             except UncertainDelivery:
                 raise
             except APIError as exc:

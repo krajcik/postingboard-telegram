@@ -8,7 +8,8 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 from bot import (APIError, Mirror, MirrorError, PostingBoard, State, Telegram,
-                 UncertainDelivery, operation_key, request_json, split_text, utf16_length)
+                 UncertainDelivery, UnsortedBoard, main, request_json, split_text,
+                 sync_all, utf16_length)
 
 
 def post(seq, root=None, body="Полный текст"):
@@ -213,6 +214,22 @@ class MirrorTests(unittest.TestCase):
 
 
 class APITests(unittest.TestCase):
+    def test_application_user_agent_and_explicit_proxy(self):
+        with patch("bot.build_opener") as opener:
+            response = opener.return_value.open.return_value.__enter__.return_value
+            response.read.return_value = b'{"ok": true}'
+            request_json("Telegram", "https://example.com", proxy="http://127.0.0.1:12334")
+            request = opener.return_value.open.call_args.args[0]
+            self.assertEqual(request.get_header("User-agent"), "postingboard-telegram/0.1")
+            self.assertEqual(opener.call_args.args[0].proxies, {"https": "http://127.0.0.1:12334"})
+
+    def test_telegram_proxy_is_scoped_to_telegram(self):
+        with patch("bot.request_json", return_value={"ok": True, "result": {}}) as request:
+            Telegram("unused", -100, proxy="http://localhost:12334").call("getMe", {})
+            self.assertEqual(request.call_args.kwargs["proxy"], "http://localhost:12334")
+            PostingBoard("https://example.com", "unused").get("activity")
+            self.assertNotIn("proxy", request.call_args.kwargs)
+
     def test_network_error_never_contains_bot_token(self):
         with patch("bot.build_opener") as opener:
             opener.return_value.open.side_effect = URLError("https://api.telegram.org/botSECRET/sendMessage")
@@ -250,6 +267,65 @@ class APITests(unittest.TestCase):
         for url in ("http://example.com", "https://user:pass@example.com", "https://example.com?key=x"):
             with self.assertRaises(MirrorError):
                 PostingBoard(url, "unused")
+
+
+class UnsortedTests(unittest.TestCase):
+    def test_feed_pagination_contains_replies_and_never_sends_named_parameters(self):
+        source = UnsortedBoard("https://example.com")
+        records = [{"id": f"p-{seq}", "seq": seq, "body": f"Текст {seq}",
+                    "thread_id": "p-1" if seq > 1 else None} for seq in range(1, 66)]
+        calls = []
+
+        def get_url(url, query):
+            self.assertEqual(url, "https://example.com/b")
+            self.assertLessEqual(set(query), {"before"})
+            calls.append(query)
+            selected = [p for p in reversed(records) if p["seq"] < query.get("before", 1000)]
+            page = selected[:20]
+            return {"items": page, "next_before": page[-1]["seq"] if len(selected) > 20 else None}
+
+        source.get_url = get_url
+        items = source.activity_since(4)
+        self.assertEqual([p["seq"] for p in items], list(range(5, 66)))
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(source.headers, {})
+        self.assertEqual(source.post("p-65")["body"], "Текст 65")
+        self.assertEqual(source.post("p-65")["topic"], "/b")
+        self.assertEqual(source.post("p-65")["author"], "Anonymous")
+
+    def test_root_older_than_feed_is_read_from_thread_endpoint(self):
+        source = UnsortedBoard("https://example.com")
+        with patch.object(source, "get_url", return_value={
+            "post": {"id": "root", "seq": 1, "body": "Первая строка\nВторая строка", "thread_id": None}
+        }) as get:
+            root = source.post("root")
+            get.assert_called_once_with("https://example.com/b/t/root", {})
+            self.assertEqual(root["title"], "Первая строка")
+            self.assertEqual(root["body"], "Первая строка\nВторая строка")
+
+    def test_cli_anonymous_check_does_not_require_named_key(self):
+        with patch.dict("os.environ", {"TELEGRAM_CHAT_ID": "-100", "TELEGRAM_BOT_TOKEN": "unused"}, clear=True):
+            with patch("bot.load_env"), patch("bot.Telegram.preflight", return_value=1), \
+                    patch("bot.UnsortedBoard.activity_page", return_value={"items": []}), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                main(["--board", "b", "check"])
+            self.assertIn("проверены", output.getvalue())
+
+    def test_two_boards_have_separate_state_and_alternate_delivery(self):
+        telegram = FakeTelegram()
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            mirrors = {}
+            for name in ("named", "b"):
+                state = stack.enter_context(contextlib.closing(State(Path(directory) / f"{name}.db", name, -100)))
+                items = [post(1, body=f"{name}-first"), post(2, body=f"{name}-second")]
+                mirrors[name] = Mirror(FakeSource(items), telegram, state)
+            self.assertEqual(sync_all(mirrors), {"named": 2, "b": 2})
+            messages = [payload for method, payload in telegram.calls if method == "sendMessage"]
+            self.assertEqual(len(messages), 4)
+            for message, body in zip(messages, ("named-first", "b-first", "named-second", "b-second")):
+                self.assertIn(body, message["text"])
+            self.assertEqual(len({m["message_thread_id"] for m in messages}), 4)
+            self.assertEqual(sync_all(mirrors), {"named": 0, "b": 0})
 
 
 if __name__ == "__main__":
